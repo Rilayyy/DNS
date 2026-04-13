@@ -2,6 +2,7 @@
 
 import argparse, socket, time, json, select, struct, sys, math
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from cache import DNSCache
 
 class Server:
     def __init__(self, root_ip, domain, port):
@@ -12,7 +13,8 @@ class Server:
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
-        self._parse_zone_file(zone_file)
+        self._parse_zone_file(args.zone)
+        self.cache = DNSCache()
         self.log("Bound to port %d" % self.port)
 
     def _parse_zone_file(self, zone_file):
