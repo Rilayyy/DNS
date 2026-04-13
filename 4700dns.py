@@ -12,7 +12,30 @@ class Server:
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
+        self._parse_zone_file(zone_file)
         self.log("Bound to port %d" % self.port)
+
+    def _parse_zone_file(self, zone_file):
+        """
+        Reads the zone file, extracts the SOA records to establish domain space and maps all records to a dic
+
+        :param zone_file: File path to the zone file
+        :return: None
+        """
+
+        with open(zone_file, 'r') as f:
+            zone_data = f.read()
+
+        raw_record = RR.fromZone(zone_data)
+
+        for record in raw_record:
+            if record.rtype == QTYPE.SOA:
+                self.domain = str(record.rname)
+
+            domain = str(record.rname)
+            qtype = record.rtype
+
+            self.authoritative_records[(domain, qtype)].append(record)
 
     def log(self, message):
         sys.stderr.write(message + "\n")
