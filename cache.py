@@ -7,6 +7,7 @@ validation to prevent cache poisoning attacks.
 
 import time
 from collections import defaultdict
+from dnslib import RR
 
 
 class DNSCache:
@@ -118,9 +119,13 @@ class DNSCache:
         :param new_ttl: The new TTL value in seconds
         :return: A new record with the adjusted TTL
         """
-        new_record = record.copy()
-        new_record.ttl = new_ttl
-        return new_record
+        return RR(
+            rname=record.rname,
+            rtype=record.rtype,
+            rclass=record.rclass,
+            ttl=new_ttl,
+            rdata=record.rdata
+        )
 
     def _in_bailiwick(self, domain, bailiwick):
         """

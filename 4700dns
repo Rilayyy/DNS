@@ -15,6 +15,7 @@ class Server:
         self.port = self.socket.getsockname()[1]
 
         self.authoritative_records = defaultdict(list)
+        self.cache = DNSCache()
         self._parse_zone_file(domain)
 
         print(f"Bound to port {self.port}")
@@ -69,13 +70,40 @@ class Server:
 
             correct_records = self.authoritative_records.get((qname, qtype), [])
 
-            if correct_records: 
+            if correct_records:
                 for record in correct_records:
                     response.add_answer(record)
-
             else:
-                response.header.rcode = 3
-            
+                """Check for CNAME record and follow the chain"""
+                cname_records = self.authoritative_records.get((qname, QTYPE.CNAME), [])
+
+                if cname_records:
+                    """Add the CNAME record to the answer"""
+                    for cname_record in cname_records:
+                        response.add_answer(cname_record)
+
+                    """Follow the CNAME chain to get the target record"""
+                    target_name = str(cname_records[0].rdata).lower()
+
+                    """Get the target record (A, AAAA, etc.) from the CNAME target"""
+                    target_records = self.authoritative_records.get((target_name, qtype), [])
+                    if target_records:
+                        for target_record in target_records:
+                            response.add_answer(target_record)
+                    else:
+                        """Target doesn't have requested type - check if it has another CNAME"""
+                        next_cname = self.authoritative_records.get((target_name, QTYPE.CNAME), [])
+                        if next_cname:
+                            for cname_record in next_cname:
+                                response.add_answer(cname_record)
+                            next_target = str(next_cname[0].rdata).lower()
+                            final_records = self.authoritative_records.get((next_target, qtype), [])
+                            if final_records:
+                                for final_record in final_records:
+                                    response.add_answer(final_record)
+                else:
+                    response.header.rcode = 3
+
             self.send(addr, response)
         
         else:
@@ -90,25 +118,100 @@ class Server:
 
     def _resolve_external(self, request):
         """
-        Resolves the request to an external server
+        Recursively resolves a DNS query by walking the DNS hierarchy.
 
-        :param request: The request to resolve
-        :return: The response
+        Starts at the root server and follows NS referrals hop-by-hop
+        until an authoritative answer is found. Uses cache at each step.
+
+        :param request: The DNS request to resolve
+        :return: DNSRecord with the final answer, or None if resolution fails
         """
+        qname = str(request.q.qname).lower().rstrip('.')
+        qtype = request.q.qtype
 
+        """Check cache first before querying upstream"""
+        cached_records = self.cache.get(qname, qtype)
+        if cached_records:
+            response = request.reply()
+            for record in cached_records:
+                response.add_answer(record)
+            return response
+
+        """Start recursive resolution from root"""
+        current_server = self.root_ip
+        max_iterations = 10
+        visited_servers = set()
+
+        for iteration in range(max_iterations):
+            if current_server in visited_servers:
+                """Loop detected, bail out"""
+                return None
+            visited_servers.add(current_server)
+
+            """Query the current server"""
+            response = self._query_server(request, current_server)
+            if not response:
+                return None
+
+            """Cache the response before processing"""
+            self.cache.cache_response(response)
+
+            """If we have an answer, return it"""
+            if response.rr:
+                return response
+
+            """Look for NS referral in authority section"""
+            ns_record = None
+            ns_ip = None
+
+            for auth in response.auth:
+                if auth.rtype == QTYPE.NS:
+                    ns_name = str(auth.rdata).lower().rstrip('.')
+                    ns_record = auth
+
+                    """Look for A record in additional section"""
+                    for ar in response.ar:
+                        if str(ar.rname).lower().rstrip('.') == ns_name and ar.rtype == QTYPE.A:
+                            ns_ip = str(ar.rdata)
+                            break
+                    break
+
+            if not ns_record:
+                """No referral found, resolution failed"""
+                return response
+
+            if not ns_ip:
+                """Need to resolve NS name to IP - try cache first"""
+                ns_cached = self.cache.get(ns_name, QTYPE.A)
+                if ns_cached:
+                    ns_ip = str(ns_cached[0].rdata)
+                else:
+                    """Can't get IP for NS server, resolution failed"""
+                    return None
+
+            current_server = ns_ip
+
+        """Too many iterations, bail out"""
+        return None
+
+    def _query_server(self, request, server_ip):
+        """
+        Send a DNS query to a specific server and return the response.
+
+        :param request: The DNS request to send
+        :param server_ip: The IP address of the server to query
+        :return: DNSRecord response, or None on error
+        """
         proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        proxy_socket = proxy_socket.settimeout(5.0)
+        proxy_socket.settimeout(5.0)
 
-        try: 
-            proxy_socket.sendto(request.pack(), (self.root_ip, 60053))
-
+        try:
+            proxy_socket.sendto(request.pack(), (server_ip, 60053))
             response_data, _ = proxy_socket.recvfrom(65535)
             return DNSRecord.parse(response_data)
-
         except Exception as e:
-            self.log(f"an error occured during external resolution: {e}")
+            self.log(f"query to {server_ip} failed: {e}")
             return None
-        
         finally:
             proxy_socket.close()
     
