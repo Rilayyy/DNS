@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, threading
+from concurrent.futures import ThreadPoolExecutor
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
 from cache import DNSCache
 from collections import defaultdict
@@ -17,6 +18,9 @@ class Server:
         self.authoritative_records = defaultdict(list)
         self.cache = DNSCache()
         self._parse_zone_file(domain)
+        
+        """Thread pool to limit concurrent request handling"""
+        self.executor = ThreadPoolExecutor(max_workers=2)
 
         print(f"Bound to port {self.port}")
         sys.stdout.flush()
@@ -118,6 +122,8 @@ class Server:
             external_response = self._resolve_external(request)
         
             if external_response:
+                external_response.header.aa = 0
+                external_response.header.ra = 1
                 self.send(addr, external_response)
             else:
                 response.header.rcode = 2
@@ -141,8 +147,16 @@ class Server:
         cached_records = self.cache.get(qname, qtype)
         if cached_records:
             response = request.reply()
+            response.header.aa = 0
+            response.header.ra = 1
             for record in cached_records:
                 response.add_answer(record)
+                """For NS queries, add glue records from cache"""
+                if qtype == QTYPE.NS:
+                    ns_target = str(record.rdata).lower().rstrip('.')
+                    glue_records = self.cache.get(ns_target, QTYPE.A)
+                    for glue in glue_records:
+                        response.add_ar(glue)
             return response
 
         """Start recursive resolution from root"""
@@ -157,7 +171,9 @@ class Server:
             visited_servers.add(current_server)
 
             """Query the current server"""
+            self.log(f"Querying server {current_server} for {qname}")
             response = self._query_server(request, current_server)
+            self.log(f"Got response: {response is not None}")
             if not response:
                 return None
 
@@ -171,8 +187,11 @@ class Server:
             """Look for NS referral in authority section"""
             ns_record = None
             ns_ip = None
+            
+            self.log(f"Response rcode={response.header.rcode}, has {len(response.auth)} authority, {len(response.ar)} additional")
 
             for auth in response.auth:
+                self.log(f"Authority record: {auth.rname} {QTYPE.get(auth.rtype)} {auth.rdata}")
                 if auth.rtype == QTYPE.NS:
                     ns_name = str(auth.rdata).lower().rstrip('.')
                     ns_record = auth
@@ -185,7 +204,11 @@ class Server:
                     break
 
             if not ns_record:
-                """No referral found, resolution failed"""
+                """No referral found, return the response as-is (may be empty)"""
+                return response
+
+            """For NS queries, return the referral response directly"""
+            if qtype == QTYPE.NS:
                 return response
 
             if not ns_ip:
@@ -194,44 +217,118 @@ class Server:
                 if ns_cached:
                     ns_ip = str(ns_cached[0].rdata)
                 else:
-                    """Can't get IP for NS server, resolution failed"""
-                    return None
+                    """Can't get IP for NS server - return the referral response"""
+                    return response
 
             current_server = ns_ip
 
         """Too many iterations, bail out"""
+        self.log(f"Max iterations reached for {qname}")
         return None
 
     def _query_server(self, request, server_ip):
         """
         Send a DNS query to a specific server and return the response.
+        Retries up to 2 times with exponential backoff on timeout.
 
         :param request: The DNS request to send
         :param server_ip: The IP address of the server to query
         :return: DNSRecord response, or None on error
         """
-        proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        proxy_socket.settimeout(5.0)
+        for attempt in range(5):
+            proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            proxy_socket.settimeout(5.0)
 
-        try:
-            proxy_socket.sendto(request.pack(), (server_ip, 60053))
-            response_data, _ = proxy_socket.recvfrom(65535)
-            return DNSRecord.parse(response_data)
-        except Exception as e:
-            self.log(f"query to {server_ip} failed: {e}")
-            return None
-        finally:
-            proxy_socket.close()
+            try:
+                proxy_socket.sendto(request.pack(), (server_ip, 60053))
+                response_data, _ = proxy_socket.recvfrom(65535)
+                return DNSRecord.parse(response_data)
+            except Exception as e:
+                self.log(f"query to {server_ip} failed (attempt {attempt + 1}): {e}")
+                if attempt < 4:
+                    time.sleep(0.2 * (attempt + 1))
+            finally:
+                proxy_socket.close()
+        return None
     
 
     def run(self):
-        seq = 0
+        """Run the server with concurrent request handling using threads."""
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
             for conn in socks:
-                self.recv(conn)
+                data, addr = conn.recvfrom(65535)
+                """Submit request to thread pool for concurrency control"""
+                self.executor.submit(self._handle_request, data, addr)
 
-        return
+    def _handle_request(self, data, addr):
+        """Handle a single DNS request in a thread."""
+        try:
+            request = DNSRecord.parse(data)
+            self.log("Received message:\n%s" % request)
+            
+            qname = str(request.q.qname)
+            qtype = request.q.qtype
+            
+            response = request.reply()
+            
+            if qname.endswith(self.domain):
+                """Handle authoritative queries"""
+                response.header.aa = 1
+                correct_records = self.authoritative_records.get((qname, qtype), [])
+                
+                if correct_records:
+                    for record in correct_records:
+                        response.add_answer(record)
+                    
+                    """For NS queries, add glue records"""
+                    if qtype == QTYPE.NS:
+                        for record in correct_records:
+                            ns_target = str(record.rdata).lower()
+                            glue_records = self.authoritative_records.get((ns_target, QTYPE.A), [])
+                            for glue in glue_records:
+                                response.add_ar(glue)
+                else:
+                    """Check for CNAME and follow the chain"""
+                    cname_records = self.authoritative_records.get((qname, QTYPE.CNAME), [])
+                    
+                    if cname_records:
+                        for cname_record in cname_records:
+                            response.add_answer(cname_record)
+                        
+                        target_name = str(cname_records[0].rdata).lower()
+                        target_records = self.authoritative_records.get((target_name, qtype), [])
+                        if target_records:
+                            for target_record in target_records:
+                                response.add_answer(target_record)
+                        else:
+                            """Check if CNAME target has another CNAME"""
+                            next_cname = self.authoritative_records.get((target_name, QTYPE.CNAME), [])
+                            if next_cname:
+                                for cname_record in next_cname:
+                                    response.add_answer(cname_record)
+                                next_target = str(next_cname[0].rdata).lower()
+                                final_records = self.authoritative_records.get((next_target, qtype), [])
+                                if final_records:
+                                    for final_record in final_records:
+                                        response.add_answer(final_record)
+                    else:
+                        response.header.rcode = 3
+                
+                self.send(addr, response)
+            else:
+                """Handle external recursive queries"""
+                external_response = self._resolve_external(request)
+                
+                if external_response:
+                    external_response.header.aa = 0
+                    external_response.header.ra = 1
+                    self.send(addr, external_response)
+                else:
+                    response.header.rcode = 2
+                    self.send(addr, response)
+        except Exception as e:
+            self.log(f"Error handling request: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='send data')
