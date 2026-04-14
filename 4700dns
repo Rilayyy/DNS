@@ -73,6 +73,14 @@ class Server:
             if correct_records:
                 for record in correct_records:
                     response.add_answer(record)
+
+                """For NS queries, add glue records (A records for NS targets)"""
+                if qtype == QTYPE.NS:
+                    for record in correct_records:
+                        ns_target = str(record.rdata).lower()
+                        glue_records = self.authoritative_records.get((ns_target, QTYPE.A), [])
+                        for glue in glue_records:
+                            response.add_ar(glue)
             else:
                 """Check for CNAME record and follow the chain"""
                 cname_records = self.authoritative_records.get((qname, QTYPE.CNAME), [])
